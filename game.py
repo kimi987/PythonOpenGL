@@ -5,6 +5,7 @@ import numpy as np
 from OpenGL.GL.shaders import compileProgram, compileShader 
 import pyrr
 from PIL import Image
+import math
 
 SCREEN_WIDTH = 640
 SCREEN_HEIGHT = 480
@@ -37,7 +38,7 @@ def initialize_glfw():
     return window
 
 
-class Cube:
+class SimpleComponent:
     def __init__(self, positions, eulers, scales):
         self.position = np.array(positions, dtype=np.float32)
         self.eulers = np.array(eulers, dtype=np.float32)
@@ -80,8 +81,8 @@ class Scene:
 
     def __init__(self):
 
-        self.cubes = [
-            Cube(
+        self.components = [
+            SimpleComponent(
                 positions=
                 [6,0,0],
                 eulers=[-90,0,90],
@@ -108,10 +109,10 @@ class Scene:
         pass
     
     def update(self, rate):
-        for cube in self.cubes:
-            cube.eulers[2] += 0.25 * rate
-            if cube.eulers[2] > 360:
-                cube.eulers[2] -= 360
+        for component in self.components:
+            component.eulers[2] += 0.25 * rate
+            if component.eulers[2] > 360:
+                component.eulers[2] -= 360
         pass
 
     def move_player(self, dPos):
@@ -244,36 +245,16 @@ class GraphicsEngine:
         # self.cube_mesh = Mesh("model/nanosuit.obj")
         self.renderObj = RenderObj("model/nanosuit.obj")
 
+        self.light_billboard = BillBorad(w = 0.2, h = 0.2)
         #initialize opengl
         glClearColor(0.1, 0.2, 0.2, 1)
         # glEnable(GL_BLEND)
         # glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
         glEnable(GL_DEPTH_TEST)
-        self.shader = self.createShader("shaders/vertex.txt", "shaders/fragment.txt")
-        glUseProgram(self.shader)
-        glUniform1i(glGetUniformLocation(self.shader, "imageTexture"), 0)
-        
-        projection_transform = pyrr.matrix44.create_perspective_projection(
-            fovy = 45, aspect = 640/480, near = 0.1, far = 50, dtype=np.float32
-        )
-        glUniformMatrix4fv(glGetUniformLocation(self.shader, "projection"), 1, GL_FALSE, projection_transform)
-        self.modelMatrixLocation = glGetUniformLocation(self.shader, "model")
-        self.viewMatrixLocation = glGetUniformLocation(self.shader, "view")
-        self.lightLocation = {
-            "position": [
-                glGetUniformLocation(self.shader, f"Lights[{i}].position")
-                for i in range(8)
-            ],
-            "color": [
-                glGetUniformLocation(self.shader, f"Lights[{i}].color")
-                for i in range(8)
-            ],
-            "strength": [
-                glGetUniformLocation(self.shader, f"Lights[{i}].strength")
-                for i in range(8)
-            ],
-        }
-        self.cameraPoLoc = glGetUniformLocation(self.shader, "cameraPosition")
+        self.LitShader = self.createShader("shaders/vertex.txt", "shaders/fragment.txt")
+        self.textureLitPass = RenderPassTextureLit3D(self.LitShader)
+        self.shader = self.createShader("shaders/vertex_light.txt", "shaders/fragment_light.txt")
+        self.texturePass = RenderPassTexture3D(self.shader)
         pass
     def createShader(self, vertexFilepath, fragmentFilepath):
 
@@ -292,32 +273,10 @@ class GraphicsEngine:
         
         #refresh screen
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
-        glUseProgram(self.shader)
+        
 
-        view_transform = pyrr.matrix44.create_look_at(
-            eye = scene.player.position,
-            target = scene.player.position + scene.player.forwards,
-            up = scene.player.up, dtype=np.float32
-        )
-
-        glUniformMatrix4fv(self.viewMatrixLocation, 1, GL_FALSE, view_transform)
-
-        for i, light in enumerate(scene.lights):
-            glUniform3fv(self.lightLocation["position"][i], 1, light.position)
-            glUniform3fv(self.lightLocation["color"][i], 1, light.color)
-            glUniform1f(self.lightLocation["strength"][i], light.strength)
-        glUniform3fv(self.cameraPoLoc, 1, scene.player.position)
-        # self.wood_texture.use()
-        # glBindVertexArray(self.cube_mesh.vao)
-        for cube in scene.cubes:
-            model_transform = pyrr.matrix44.create_identity(dtype=np.float32)
-            model_transform = pyrr.matrix44.multiply(m1=model_transform, m2=pyrr.matrix44.create_from_eulers(eulers=np.radians(cube.eulers), dtype=np.float32))
-            model_transform = pyrr.matrix44.multiply(m1=model_transform, m2=pyrr.matrix44.create_from_scale(scale=np.array(cube.scales), dtype=np.float32))
-            model_transform = pyrr.matrix44.multiply(m1=model_transform, m2=pyrr.matrix44.create_from_translation(vec=np.array(cube.position), dtype=np.float32))
-            glUniformMatrix4fv(self.modelMatrixLocation, 1, GL_FALSE, model_transform)
-            self.renderObj.render()
-            # glDrawArrays(GL_TRIANGLES, 0, self.cube_mesh.vertex_count)
-
+        self.textureLitPass.render(scene, self)
+        self.texturePass.render(scene, self)
         glFlush()
         pass
     def quit(self):
@@ -325,7 +284,117 @@ class GraphicsEngine:
         # self.wood_texture.destroy()
         self.renderObj.destroy()
         glDeleteProgram(self.shader)
+        glDeleteProgram(self.LitShader)
 
+class RenderPassTextureLit3D:
+    
+    def __init__(self, shader):
+        self.shader = shader
+        glUseProgram(self.shader)
+        glUniform1i(glGetUniformLocation(self.shader, "imageTexture"), 0)
+        projection_transform = pyrr.matrix44.create_perspective_projection(
+            fovy=45, aspect=640/480, near=0.1, far=50, dtype=np.float32
+        )
+        glUniformMatrix4fv(glGetUniformLocation(self.shader, "projection"), 1, GL_FALSE, projection_transform)
+        self.modelMatrixLocation = glGetUniformLocation(self.shader, "model")
+        self.viewMatrixLocation = glGetUniformLocation(self.shader, "view")
+        self.lightLocation = {
+            "position": [glGetUniformLocation(self.shader, f"Lights[{i}].position")
+            for i in range(8)
+            ],
+            "color": [glGetUniformLocation(self.shader, f"Lights[{i}].color")
+            for i in range(8)
+            ],
+            "strength": [glGetUniformLocation(self.shader, f"Lights[{i}].strength")
+            for i in range(8)
+            ]
+        }
+        self.cameraPosLoc = glGetUniformLocation(self.shader, "cameraPosition")
+        pass
+    def render(self, scene, engine):
+        glUseProgram(self.shader)
+
+        view_transform = pyrr.matrix44.create_look_at(
+            eye=scene.player.position,
+            target=scene.player.position + scene.player.forwards,
+            up=scene.player.up, dtype=np.float32
+        )
+        glUniformMatrix4fv(self.viewMatrixLocation, 1, GL_FALSE, view_transform)
+        glUniform3fv(self.cameraPosLoc, 1, scene.player.position)
+
+        for i, light in enumerate(scene.lights):
+            glUniform3fv(self.lightLocation["position"][i], 1, light.position)
+            glUniform3fv(self.lightLocation["color"][i], 1, light.color)
+            glUniform1f(self.lightLocation["strength"][i], light.strength)
+            pass
+
+        for component in scene.components:
+            model_transform = pyrr.matrix44.create_identity(dtype=np.float32)
+            model_transform = pyrr.matrix44.multiply(m1=model_transform, m2=pyrr.matrix44.create_from_eulers(eulers=np.radians(component.eulers), dtype=np.float32))
+            model_transform = pyrr.matrix44.multiply(m1=model_transform, m2=pyrr.matrix44.create_from_scale(scale=np.array(component.scales), dtype=np.float32))
+            model_transform = pyrr.matrix44.multiply(m1=model_transform, m2=pyrr.matrix44.create_from_translation(vec=np.array(component.position), dtype=np.float32))
+            glUniformMatrix4fv(self.modelMatrixLocation, 1, GL_FALSE, model_transform)
+            engine.renderObj.render()
+            pass
+        pass
+
+    def destroy(self):
+        pass
+    pass
+
+class RenderPassTexture3D:
+    def __init__(self, shader):
+        self.shader = shader
+        glUseProgram(self.shader)
+
+        projection_transform = pyrr.matrix44.create_perspective_projection(
+            fovy=45, aspect=640/480,
+            near=0.1, far= 50, dtype=np.float32
+        )
+        glUniformMatrix4fv(glGetUniformLocation(self.shader, "projection"), 1, GL_FALSE, projection_transform)
+
+        self.modelMatrixLocation = glGetUniformLocation(self.shader, "model")
+        self.viewMatrixLocation = glGetUniformLocation(self.shader, "view")
+        self.lightColorLocation = glGetUniformLocation(self.shader, "lightColor")
+
+        pass
+    def render(self, scene, engine):
+        glUseProgram(self.shader)
+
+        view_transform = pyrr.matrix44.create_look_at(
+            eye=scene.player.position,
+            target=scene.player.position + scene.player.forwards,
+            up=scene.player.up, dtype=np.float32
+        )
+
+        glUniformMatrix4fv(self.viewMatrixLocation, 1, GL_FALSE, view_transform)
+
+        for i, light in enumerate(scene.lights):
+            glUniform3fv(self.lightColorLocation, 1, light.color)
+
+            directionFromPlayer = light.position - scene.player.position
+            angle1 = np.arctan2(-directionFromPlayer[1],directionFromPlayer[0])
+            dist2d = math.sqrt(directionFromPlayer[0] ** 2 + directionFromPlayer[1] ** 2)
+            angle2 = np.arctan2(directionFromPlayer[2],dist2d)
+
+            model_transform = pyrr.matrix44.create_identity(dtype=np.float32)
+            model_transform = pyrr.matrix44.multiply(
+                model_transform,
+                pyrr.matrix44.create_from_y_rotation(theta=angle2, dtype=np.float32)
+            )
+            model_transform = pyrr.matrix44.multiply(
+                model_transform,
+                pyrr.matrix44.create_from_z_rotation(theta=angle1, dtype=np.float32)
+            )
+            model_transform = pyrr.matrix44.multiply(
+                model_transform,
+                pyrr.matrix44.create_from_translation(light.position,dtype=np.float32)
+            )
+            glUniformMatrix4fv(self.modelMatrixLocation, 1, GL_FALSE, model_transform)
+            glBindVertexArray(engine.light_billboard.vao)
+            glDrawArrays(GL_TRIANGLES, 0, engine.light_billboard.vertex_count)
+            pass
+    pass
 class CubeMesh:
     def __init__(self):
           # x, y, z, s, t
@@ -571,6 +640,42 @@ class Material:
         pass
     def destroy(self):
         glDeleteTextures(1, (self.texture,))
+
+class BillBorad:
+
+    def __init__(self, w, h):
+        #x,y,z, s,t, normal
+        self.vertices = (
+            0, -w/2,  h/2, 0, 0, -1, 0, 0,
+            0, -w/2, -h/2, 0, 1, -1, 0, 0,
+            0,  w/2, -h/2, 1, 1, -1, 0, 0,
+
+            0, -w/2,  h/2, 0, 0, -1, 0, 0,
+            0,  w/2, -h/2, 1, 1, -1, 0, 0,
+            0,  w/2,  h/2, 1, 0, -1, 0, 0
+        )
+        self.vertices = np.array(self.vertices, dtype=np.float32)
+        self.vertex_count = 6
+
+        self.vao = glGenVertexArrays(1)
+        glBindVertexArray(self.vao)
+        self.vbo = glGenBuffers(1)
+        glBindBuffer(GL_ARRAY_BUFFER, self.vbo)
+        glBufferData(GL_ARRAY_BUFFER, self.vertices.nbytes, self.vertices, GL_STATIC_DRAW)
+
+        glEnableVertexAttribArray(0)
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 32, ctypes.c_void_p(0))
+        glEnableVertexAttribArray(1)
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 32, ctypes.c_void_p(12))
+        glEnableVertexAttribArray(2)
+        glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, 32, ctypes.c_void_p(20))
+        pass
+
+    def destroy(self):
+        glDeleteVertexArrays(1, (self.vao, ))
+        glDeleteBuffers(1, (self.vbo, ))
+        pass
+
 class VMesh:
     def __init__(self, vertices):
         self.vertices = vertices
